@@ -16,21 +16,30 @@ const uint32_t LED_BLINK_INTERVAL_MS = 500;
 const char *AP_SSID = "HLC_ESP01";
 const char *AP_PASSWORD = "";  // Leave empty for an open AP, or use 8+ chars.
 
-const uint16_t MAX_RELAY_SECONDS = 2;
+const uint16_t MIN_RELAY_SECONDS = 1;
+const uint16_t MAX_RELAY_SECONDS = 5;
+const uint16_t DEFAULT_RELAY_SECONDS = 3;
 const uint32_t MAX_RELAY_MS = MAX_RELAY_SECONDS * 1000UL;
-const uint32_t EEPROM_MAGIC = 0x484C4333;  // HLC3
-const uint32_t TRIGGER_EEPROM_MAGIC = 0x484C5431;  // HLT1
+const uint32_t EEPROM_MAGIC = 0x484C4334;  // HLC4
+const uint32_t EEPROM_MAGIC_V3 = 0x484C4333;  // HLC3
+const uint32_t TRIGGER_EEPROM_MAGIC = 0x484C5432;  // HLT2
+const uint32_t TRIGGER_EEPROM_MAGIC_V1 = 0x484C5431;  // HLT1
 const int TRIGGER_EEPROM_OFFSET = 128;
 const uint8_t WIFI_SSID_MAX = 32;
 const uint8_t WIFI_PASSWORD_MAX = 64;
 
 ESP8266WebServer server(80);
 
-struct ScheduleConfig {
-  bool enabled = false;
+struct ScheduleSlot {
   uint8_t hour = 8;
   uint8_t minute = 0;
-  uint8_t durationSeconds = 2;
+  uint8_t durationSeconds = DEFAULT_RELAY_SECONDS;
+};
+
+struct ScheduleConfig {
+  bool enabled = false;
+  ScheduleSlot slot1;
+  ScheduleSlot slot2 = {18, 0, DEFAULT_RELAY_SECONDS};
 };
 
 ScheduleConfig scheduleConfig;
@@ -45,6 +54,19 @@ WifiConfig wifiConfig;
 struct PersistedConfig {
   uint32_t magic;
   uint8_t enabled;
+  uint8_t hour1;
+  uint8_t minute1;
+  uint8_t duration1;
+  uint8_t hour2;
+  uint8_t minute2;
+  uint8_t duration2;
+  char wifiSsid[WIFI_SSID_MAX + 1];
+  char wifiPassword[WIFI_PASSWORD_MAX + 1];
+} __attribute__((packed));
+
+struct PersistedConfigV3 {
+  uint32_t magic;
+  uint8_t enabled;
   uint8_t hour;
   uint8_t minute;
   uint8_t durationSeconds;
@@ -57,12 +79,21 @@ struct PersistedTriggerRecord {
   uint8_t hasRecord;
   uint32_t triggeredEpochSeconds;
   uint8_t durationSeconds;
+  uint8_t slotIndex;
+} __attribute__((packed));
+
+struct PersistedTriggerRecordV1 {
+  uint32_t magic;
+  uint8_t hasRecord;
+  uint32_t triggeredEpochSeconds;
+  uint8_t durationSeconds;
 } __attribute__((packed));
 
 struct ScheduleTriggerRecord {
   bool hasRecord = false;
   uint32_t triggeredEpochSeconds = 0;
   uint8_t durationSeconds = 0;
+  uint8_t slotIndex = 0;
 };
 
 ScheduleTriggerRecord lastScheduleTrigger;
@@ -76,7 +107,7 @@ uint32_t lastLedBlinkMs = 0;
 bool clockSynced = false;
 uint32_t syncedAtMs = 0;
 uint32_t syncedEpochSeconds = 0;  // Seconds since an arbitrary day 0.
-uint32_t lastTriggeredKey = 0xFFFFFFFF;
+uint32_t lastTriggeredKeys[2] = {0xFFFFFFFF, 0xFFFFFFFF};
 
 String htmlPage() {
   return R"HTML(
@@ -91,6 +122,7 @@ String htmlPage() {
     main { max-width: 520px; margin: 0 auto; padding: 20px; }
     .card { background: white; border-radius: 16px; padding: 18px; margin: 14px 0; box-shadow: 0 3px 14px #0001; }
     h1 { font-size: 24px; margin: 8px 0 4px; }
+    h3 { font-size: 18px; margin: 16px 0 0; }
     label { display: block; margin: 12px 0 5px; font-weight: bold; }
     input, button { width: 100%; font-size: 18px; box-sizing: border-box; border-radius: 10px; }
     input { padding: 10px; border: 1px solid #cbd3df; }
@@ -124,22 +156,33 @@ String htmlPage() {
     <div>Relay 狀態</div>
     <div id="relayStatus" class="status">讀取中...</div>
     <div id="clockStatus" class="muted"></div>
+    <label for="manualDuration">手動開啟秒數（1-5 秒）</label>
+    <input id="manualDuration" type="number" min="1" max="5" value="3">
     <div class="row">
-      <button class="on" onclick="relayOn()">開啟 2 秒</button>
+      <button class="on" onclick="relayOn()">開啟 Relay</button>
       <button class="off" onclick="relayOff()">立即關閉</button>
     </div>
-    <p class="muted">安全限制：每次開啟最多 2 秒後自動關閉。</p>
+    <p class="muted">每次開啟會在設定秒數後自動關閉，最多 5 秒。</p>
   </section>
 
   <section class="card">
-    <h2>每日固定時間開啟</h2>
+    <h2>每日固定時間開啟（兩個時段）</h2>
     <label>
       <input id="enabled" type="checkbox" style="width:auto"> 啟用排程
     </label>
-    <label for="time">開啟時間</label>
-    <input id="time" type="time" value="08:00">
-    <label for="duration">開啟秒數（最多 2 秒）</label>
-    <input id="duration" type="number" min="1" max="2" value="2">
+
+    <h3>時段 1</h3>
+    <label for="time1">開啟時間</label>
+    <input id="time1" type="time" value="08:00">
+    <label for="duration1">開啟秒數（1-5 秒）</label>
+    <input id="duration1" type="number" min="1" max="5" value="3">
+
+    <h3>時段 2</h3>
+    <label for="time2">開啟時間</label>
+    <input id="time2" type="time" value="18:00">
+    <label for="duration2">開啟秒數（1-5 秒）</label>
+    <input id="duration2" type="number" min="1" max="5" value="3">
+
     <button class="save" onclick="saveSchedule()">儲存排程</button>
     <button class="save" onclick="syncTime()">同步手機時間</button>
     <div id="scheduleState" class="muted">排程狀態讀取中...</div>
@@ -168,8 +211,10 @@ async function api(path) {
 
 function applyScheduleForm(schedule) {
   document.getElementById('enabled').checked = schedule.enabled;
-  document.getElementById('time').value = schedule.time;
-  document.getElementById('duration').value = schedule.durationSeconds;
+  document.getElementById('time1').value = schedule.slot1.time;
+  document.getElementById('duration1').value = schedule.slot1.durationSeconds;
+  document.getElementById('time2').value = schedule.slot2.time;
+  document.getElementById('duration2').value = schedule.slot2.durationSeconds;
 }
 
 async function syncTime() {
@@ -193,23 +238,26 @@ async function updateStatus() {
   if (s.schedule.enabled) {
     document.getElementById('scheduleState').textContent =
       s.clockSynced
-        ? `排程已啟用，等待今日 ${s.schedule.time} 自動啟動`
+        ? `排程已啟用，等待今日 ${s.schedule.slot1.time}、${s.schedule.slot2.time} 自動啟動`
         : `排程已啟用，但尚未同步時間`;
   } else {
     document.getElementById('scheduleState').textContent = '排程未啟用';
   }
 
   if (s.lastScheduleTrigger.hasRecord) {
+    const slotLabel = s.lastScheduleTrigger.slotIndex ? `時段 ${s.lastScheduleTrigger.slotIndex}` : '排程';
     document.getElementById('lastTriggerStatus').textContent =
-      `上次排程成功啟動：${s.lastScheduleTrigger.timeText}，開啟 ${s.lastScheduleTrigger.durationSeconds} 秒`;
+      `上次${slotLabel}成功啟動：${s.lastScheduleTrigger.timeText}，開啟 ${s.lastScheduleTrigger.durationSeconds} 秒`;
   } else {
     document.getElementById('lastTriggerStatus').textContent = '尚無排程成功啟動紀錄';
   }
 
   const editingSchedule =
     scheduleDirty ||
-    document.activeElement === document.getElementById('time') ||
-    document.activeElement === document.getElementById('duration') ||
+    document.activeElement === document.getElementById('time1') ||
+    document.activeElement === document.getElementById('time2') ||
+    document.activeElement === document.getElementById('duration1') ||
+    document.activeElement === document.getElementById('duration2') ||
     document.activeElement === document.getElementById('enabled');
 
   if (!scheduleFormReady || !editingSchedule) {
@@ -229,7 +277,8 @@ async function updateStatus() {
 }
 
 async function relayOn() {
-  await api('/api/on');
+  const duration = document.getElementById('manualDuration').value || 3;
+  await api('/api/on?duration=' + duration);
   updateStatus();
 }
 
@@ -240,12 +289,17 @@ async function relayOff() {
 
 async function saveSchedule() {
   const enabled = document.getElementById('enabled').checked ? 1 : 0;
-  const time = document.getElementById('time').value || '08:00';
-  const duration = document.getElementById('duration').value || 2;
-  const parts = time.split(':');
-  const hour = parts[0] || '8';
-  const minute = parts[1] || '0';
-  const result = await api(`/api/config?enabled=${enabled}&hour=${hour}&minute=${minute}&duration=${duration}`);
+  const time1 = document.getElementById('time1').value || '08:00';
+  const time2 = document.getElementById('time2').value || '18:00';
+  const duration1 = document.getElementById('duration1').value || 3;
+  const duration2 = document.getElementById('duration2').value || 3;
+  const parts1 = time1.split(':');
+  const parts2 = time2.split(':');
+  const hour1 = parts1[0] || '8';
+  const minute1 = parts1[1] || '0';
+  const hour2 = parts2[0] || '18';
+  const minute2 = parts2[1] || '0';
+  const result = await api(`/api/config?enabled=${enabled}&hour1=${hour1}&minute1=${minute1}&duration1=${duration1}&hour2=${hour2}&minute2=${minute2}&duration2=${duration2}`);
   if (result.ok) {
     showScheduleMsg('排程已儲存');
     scheduleFormReady = false;
@@ -266,8 +320,10 @@ async function saveWiFi() {
 
 function initPage() {
   document.getElementById('enabled').addEventListener('change', markScheduleDirty);
-  document.getElementById('time').addEventListener('input', markScheduleDirty);
-  document.getElementById('duration').addEventListener('input', markScheduleDirty);
+  document.getElementById('time1').addEventListener('input', markScheduleDirty);
+  document.getElementById('time2').addEventListener('input', markScheduleDirty);
+  document.getElementById('duration1').addEventListener('input', markScheduleDirty);
+  document.getElementById('duration2').addEventListener('input', markScheduleDirty);
   syncTime().then(updateStatus);
   setInterval(updateStatus, 1000);
 }
@@ -279,34 +335,52 @@ initPage();
 )HTML";
 }
 
+void loadWifiFromSaved(const char *ssid, const char *password) {
+  memcpy(wifiConfig.ssid, ssid, WIFI_SSID_MAX + 1);
+  memcpy(wifiConfig.password, password, WIFI_PASSWORD_MAX + 1);
+  wifiConfig.ssid[WIFI_SSID_MAX] = '\0';
+  wifiConfig.password[WIFI_PASSWORD_MAX] = '\0';
+}
+
 void loadScheduleConfig() {
   PersistedConfig saved;
   EEPROM.get(0, saved);
 
-  if (saved.magic != EEPROM_MAGIC) {
+  if (saved.magic == EEPROM_MAGIC) {
+    if (saved.hour1 <= 23 && saved.minute1 <= 59 && saved.hour2 <= 23 && saved.minute2 <= 59) {
+      scheduleConfig.enabled = saved.enabled == 1;
+      scheduleConfig.slot1.hour = saved.hour1;
+      scheduleConfig.slot1.minute = saved.minute1;
+      scheduleConfig.slot1.durationSeconds = constrain(saved.duration1, MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
+      scheduleConfig.slot2.hour = saved.hour2;
+      scheduleConfig.slot2.minute = saved.minute2;
+      scheduleConfig.slot2.durationSeconds = constrain(saved.duration2, MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
+    }
+    loadWifiFromSaved(saved.wifiSsid, saved.wifiPassword);
     return;
   }
 
-  if (saved.hour <= 23 && saved.minute <= 59) {
-    scheduleConfig.enabled = saved.enabled == 1;
-    scheduleConfig.hour = saved.hour;
-    scheduleConfig.minute = saved.minute;
-    scheduleConfig.durationSeconds = constrain(saved.durationSeconds, 1, MAX_RELAY_SECONDS);
+  PersistedConfigV3 savedV3;
+  EEPROM.get(0, savedV3);
+  if (savedV3.magic == EEPROM_MAGIC_V3 && savedV3.hour <= 23 && savedV3.minute <= 59) {
+    scheduleConfig.enabled = savedV3.enabled == 1;
+    scheduleConfig.slot1.hour = savedV3.hour;
+    scheduleConfig.slot1.minute = savedV3.minute;
+    scheduleConfig.slot1.durationSeconds = constrain(savedV3.durationSeconds, MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
+    loadWifiFromSaved(savedV3.wifiSsid, savedV3.wifiPassword);
   }
-
-  memcpy(wifiConfig.ssid, saved.wifiSsid, sizeof(wifiConfig.ssid));
-  memcpy(wifiConfig.password, saved.wifiPassword, sizeof(wifiConfig.password));
-  wifiConfig.ssid[WIFI_SSID_MAX] = '\0';
-  wifiConfig.password[WIFI_PASSWORD_MAX] = '\0';
 }
 
 void saveScheduleConfig() {
   PersistedConfig saved;
   saved.magic = EEPROM_MAGIC;
   saved.enabled = scheduleConfig.enabled ? 1 : 0;
-  saved.hour = scheduleConfig.hour;
-  saved.minute = scheduleConfig.minute;
-  saved.durationSeconds = scheduleConfig.durationSeconds;
+  saved.hour1 = scheduleConfig.slot1.hour;
+  saved.minute1 = scheduleConfig.slot1.minute;
+  saved.duration1 = scheduleConfig.slot1.durationSeconds;
+  saved.hour2 = scheduleConfig.slot2.hour;
+  saved.minute2 = scheduleConfig.slot2.minute;
+  saved.duration2 = scheduleConfig.slot2.durationSeconds;
   strncpy(saved.wifiSsid, wifiConfig.ssid, sizeof(saved.wifiSsid));
   strncpy(saved.wifiPassword, wifiConfig.password, sizeof(saved.wifiPassword));
   saved.wifiSsid[WIFI_SSID_MAX] = '\0';
@@ -320,17 +394,31 @@ void loadTriggerRecord() {
   PersistedTriggerRecord saved;
   EEPROM.get(TRIGGER_EEPROM_OFFSET, saved);
 
-  if (saved.magic != TRIGGER_EEPROM_MAGIC || !saved.hasRecord) {
+  if (saved.magic == TRIGGER_EEPROM_MAGIC && saved.hasRecord) {
+    lastScheduleTrigger.hasRecord = true;
+    lastScheduleTrigger.triggeredEpochSeconds = saved.triggeredEpochSeconds;
+    lastScheduleTrigger.durationSeconds = saved.durationSeconds;
+    lastScheduleTrigger.slotIndex = saved.slotIndex;
+
+    uint32_t day = saved.triggeredEpochSeconds / 86400UL;
+    uint32_t minuteOfDay = (saved.triggeredEpochSeconds % 86400UL) / 60UL;
+    uint8_t slotArrayIndex = saved.slotIndex >= 1 && saved.slotIndex <= 2 ? saved.slotIndex - 1 : 0;
+    lastTriggeredKeys[slotArrayIndex] = day * 1440UL + minuteOfDay;
     return;
   }
 
-  lastScheduleTrigger.hasRecord = true;
-  lastScheduleTrigger.triggeredEpochSeconds = saved.triggeredEpochSeconds;
-  lastScheduleTrigger.durationSeconds = saved.durationSeconds;
+  PersistedTriggerRecordV1 savedV1;
+  EEPROM.get(TRIGGER_EEPROM_OFFSET, savedV1);
+  if (savedV1.magic == TRIGGER_EEPROM_MAGIC_V1 && savedV1.hasRecord) {
+    lastScheduleTrigger.hasRecord = true;
+    lastScheduleTrigger.triggeredEpochSeconds = savedV1.triggeredEpochSeconds;
+    lastScheduleTrigger.durationSeconds = savedV1.durationSeconds;
+    lastScheduleTrigger.slotIndex = 1;
 
-  uint32_t day = saved.triggeredEpochSeconds / 86400UL;
-  uint32_t minuteOfDay = (saved.triggeredEpochSeconds % 86400UL) / 60UL;
-  lastTriggeredKey = day * 1440UL + minuteOfDay;
+    uint32_t day = savedV1.triggeredEpochSeconds / 86400UL;
+    uint32_t minuteOfDay = (savedV1.triggeredEpochSeconds % 86400UL) / 60UL;
+    lastTriggeredKeys[0] = day * 1440UL + minuteOfDay;
+  }
 }
 
 void saveTriggerRecord() {
@@ -339,18 +427,22 @@ void saveTriggerRecord() {
   saved.hasRecord = lastScheduleTrigger.hasRecord ? 1 : 0;
   saved.triggeredEpochSeconds = lastScheduleTrigger.triggeredEpochSeconds;
   saved.durationSeconds = lastScheduleTrigger.durationSeconds;
+  saved.slotIndex = lastScheduleTrigger.slotIndex;
 
   EEPROM.put(TRIGGER_EEPROM_OFFSET, saved);
   EEPROM.commit();
 }
 
-void recordScheduleTrigger(uint8_t durationSeconds) {
+void recordScheduleTrigger(uint8_t durationSeconds, uint8_t slotIndex) {
   lastScheduleTrigger.hasRecord = true;
   lastScheduleTrigger.triggeredEpochSeconds = nowEpochSeconds();
   lastScheduleTrigger.durationSeconds = durationSeconds;
+  lastScheduleTrigger.slotIndex = slotIndex;
   saveTriggerRecord();
 
-  Serial.print("Schedule triggered at ");
+  Serial.print("Schedule slot ");
+  Serial.print(slotIndex);
+  Serial.print(" triggered at ");
   Serial.println(epochToTimeText(lastScheduleTrigger.triggeredEpochSeconds));
 }
 
@@ -425,11 +517,8 @@ void writeLed(bool on) {
 }
 
 void turnRelayOn(uint8_t requestedSeconds) {
-  uint8_t safeSeconds = constrain(requestedSeconds, 1, MAX_RELAY_SECONDS);
+  uint8_t safeSeconds = constrain(requestedSeconds, MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
   relayAutoOffAfterMs = safeSeconds * 1000UL;
-  if (relayAutoOffAfterMs > MAX_RELAY_MS) {
-    relayAutoOffAfterMs = MAX_RELAY_MS;
-  }
   relayOnAtMs = millis();
   writeRelay(true);
 }
@@ -443,7 +532,8 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  String scheduleTime = twoDigits(scheduleConfig.hour) + ":" + twoDigits(scheduleConfig.minute);
+  String scheduleTime1 = twoDigits(scheduleConfig.slot1.hour) + ":" + twoDigits(scheduleConfig.slot1.minute);
+  String scheduleTime2 = twoDigits(scheduleConfig.slot2.hour) + ":" + twoDigits(scheduleConfig.slot2.minute);
   bool wifiConnected = WiFi.status() == WL_CONNECTED;
   String json = "{";
   json += "\"relayOn\":" + String(relayOn ? "true" : "false") + ",";
@@ -456,13 +546,19 @@ void handleStatus() {
   json += "},";
   json += "\"schedule\":{";
   json += "\"enabled\":" + String(scheduleConfig.enabled ? "true" : "false") + ",";
-  json += "\"time\":\"" + scheduleTime + "\",";
-  json += "\"durationSeconds\":" + String(scheduleConfig.durationSeconds);
+  json += "\"slot1\":{";
+  json += "\"time\":\"" + scheduleTime1 + "\",";
+  json += "\"durationSeconds\":" + String(scheduleConfig.slot1.durationSeconds);
   json += "},";
+  json += "\"slot2\":{";
+  json += "\"time\":\"" + scheduleTime2 + "\",";
+  json += "\"durationSeconds\":" + String(scheduleConfig.slot2.durationSeconds);
+  json += "}},";
   json += "\"lastScheduleTrigger\":{";
   json += "\"hasRecord\":" + String(lastScheduleTrigger.hasRecord ? "true" : "false") + ",";
   json += "\"timeText\":\"" + (lastScheduleTrigger.hasRecord ? epochToTimeText(lastScheduleTrigger.triggeredEpochSeconds) : String("--:--:--")) + "\",";
-  json += "\"durationSeconds\":" + String(lastScheduleTrigger.durationSeconds);
+  json += "\"durationSeconds\":" + String(lastScheduleTrigger.durationSeconds) + ",";
+  json += "\"slotIndex\":" + String(lastScheduleTrigger.slotIndex);
   json += "}}";
   server.send(200, "application/json", json);
 }
@@ -482,7 +578,11 @@ void handleTimeSync() {
 }
 
 void handleRelayOn() {
-  turnRelayOn(MAX_RELAY_SECONDS);
+  uint8_t seconds = DEFAULT_RELAY_SECONDS;
+  if (server.hasArg("duration")) {
+    seconds = constrain(server.arg("duration").toInt(), MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
+  }
+  turnRelayOn(seconds);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -513,17 +613,27 @@ void handleConfig() {
   if (server.hasArg("enabled")) {
     scheduleConfig.enabled = server.arg("enabled").toInt() == 1;
   }
-  if (server.hasArg("hour")) {
-    scheduleConfig.hour = constrain(server.arg("hour").toInt(), 0, 23);
+  if (server.hasArg("hour1")) {
+    scheduleConfig.slot1.hour = constrain(server.arg("hour1").toInt(), 0, 23);
   }
-  if (server.hasArg("minute")) {
-    scheduleConfig.minute = constrain(server.arg("minute").toInt(), 0, 59);
+  if (server.hasArg("minute1")) {
+    scheduleConfig.slot1.minute = constrain(server.arg("minute1").toInt(), 0, 59);
   }
-  if (server.hasArg("duration")) {
-    scheduleConfig.durationSeconds = constrain(server.arg("duration").toInt(), 1, MAX_RELAY_SECONDS);
+  if (server.hasArg("duration1")) {
+    scheduleConfig.slot1.durationSeconds = constrain(server.arg("duration1").toInt(), MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
+  }
+  if (server.hasArg("hour2")) {
+    scheduleConfig.slot2.hour = constrain(server.arg("hour2").toInt(), 0, 23);
+  }
+  if (server.hasArg("minute2")) {
+    scheduleConfig.slot2.minute = constrain(server.arg("minute2").toInt(), 0, 59);
+  }
+  if (server.hasArg("duration2")) {
+    scheduleConfig.slot2.durationSeconds = constrain(server.arg("duration2").toInt(), MIN_RELAY_SECONDS, MAX_RELAY_SECONDS);
   }
 
-  lastTriggeredKey = 0xFFFFFFFF;
+  lastTriggeredKeys[0] = 0xFFFFFFFF;
+  lastTriggeredKeys[1] = 0xFFFFFFFF;
   saveScheduleConfig();
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -534,24 +644,29 @@ void updateRelaySafetyTimer() {
   }
 }
 
+void checkScheduleSlot(uint8_t slotArrayIndex, uint8_t slotNumber, const ScheduleSlot &slot) {
+  uint32_t nowSeconds = nowEpochSeconds();
+  uint32_t day = nowSeconds / 86400UL;
+  uint32_t secondsOfDay = nowSeconds % 86400UL;
+  uint32_t currentMinute = secondsOfDay / 60UL;
+  uint32_t scheduleMinute = slot.hour * 60UL + slot.minute;
+  uint32_t currentKey = day * 1440UL + currentMinute;
+  uint32_t targetKey = day * 1440UL + scheduleMinute;
+
+  if (currentKey == targetKey && lastTriggeredKeys[slotArrayIndex] != targetKey) {
+    lastTriggeredKeys[slotArrayIndex] = targetKey;
+    recordScheduleTrigger(slot.durationSeconds, slotNumber);
+    turnRelayOn(slot.durationSeconds);
+  }
+}
+
 void updateSchedule() {
   if (!scheduleConfig.enabled || !clockSynced) {
     return;
   }
 
-  uint32_t nowSeconds = nowEpochSeconds();
-  uint32_t day = nowSeconds / 86400UL;
-  uint32_t secondsOfDay = nowSeconds % 86400UL;
-  uint32_t currentMinute = secondsOfDay / 60UL;
-  uint32_t scheduleMinute = scheduleConfig.hour * 60UL + scheduleConfig.minute;
-  uint32_t currentKey = day * 1440UL + currentMinute;
-  uint32_t targetKey = day * 1440UL + scheduleMinute;
-
-  if (currentKey == targetKey && lastTriggeredKey != targetKey) {
-    lastTriggeredKey = targetKey;
-    recordScheduleTrigger(scheduleConfig.durationSeconds);
-    turnRelayOn(scheduleConfig.durationSeconds);
-  }
+  checkScheduleSlot(0, 1, scheduleConfig.slot1);
+  checkScheduleSlot(1, 2, scheduleConfig.slot2);
 }
 
 void updateHeartbeatLed() {
